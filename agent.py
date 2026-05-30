@@ -32,8 +32,8 @@ from langchain_core.messages import (
 from langchain_core.tools import tool
 from collections import defaultdict
 
-GROQ_KEYS_RAW = "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"
-SERPER_KEY    = "8bce9d02eac60880c540ef4007b5141fcb3c8501"
+GROQ_KEYS_RAW = os.getenv("GROQ_API_KEY", "")
+SERPER_KEY    = os.getenv("SERPER_API_KEY", "")
 mmodel      = "openai/gpt-oss-120b" 
 SUMMARISER_MODEL = "llama-3.3-70b-versatile"
 
