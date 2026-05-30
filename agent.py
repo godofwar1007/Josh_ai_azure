@@ -3,513 +3,666 @@ import asyncpg
 import uuid
 import os
 import itertools
-import httpx
-from typing import TypedDict, Annotated, Literal, cast, Optional
-from contextlib import asynccontextmanager
-from placement import placement_Retriever
-from fastapi import FastAPI, HTTPException, Query
+import json 
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from pydantic import BaseModel
+from datetime import datetime
+import httpx
+from typing import TypedDict, Annotated, Literal, cast, Optional, List
+from contextlib import asynccontextmanager
 
+from placement import placement_Retriever
 from qdrant import RulesRetriever
 from orcr import ORCR_Retriever
+from user_crud_asyncpg import (
+    init_db_pool, close_db_pool, get_pool,
+    get_by_email, create_user, update_user,
+    create_schema, usage_schema, upadate_schema,
+    Category, Gender, get_by_id,
+)
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.types import Send                     
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    HumanMessage, AIMessage, SystemMessage, ToolMessage,
+)
 from langchain_core.tools import tool
+from collections import defaultdict
 
-from user_crud_asyncpg import init_db_pool, close_db_pool, get_pool, get_by_email, create_user, update_user, create_schema, usage_schema, upadate_schema, Category, Gender, get_by_id
-from datetime import datetime
-from pydantic import BaseModel
+GROQ_KEYS_RAW = "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"
+SERPER_KEY    = "8bce9d02eac60880c540ef4007b5141fcb3c8501"
+mmodel      = "openai/gpt-oss-120b" 
+SUMMARISER_MODEL = "llama-3.3-70b-versatile"
 
-load_dotenv()
-PASTE_GROQ_KEYS_HERE = os.getenv("GROQ_API_KEY", "")  # comma separated if multiple
-PASTE_SERPER_KEY_HERE = os.getenv("SERPER_API_KEY", "")
-
-SESSION_STORAGE = {}
 
 class APIKeyRotator:
-    def __init__(self, raw_keys_string: str):
-        self.keys = [k.strip() for k in raw_keys_string.split(",") if k.strip()]
+    def __init__(self, raw: str):
+        self.keys = [k.strip() for k in raw.split(",") if k.strip()]
         if not self.keys:
-            raise ValueError("CRITICAL: No valid API keys provided in configuration.")
-        self.pool = itertools.cycle(self.keys)
-        print(f"Successfully initialized Key Pool with {len(self.keys)} keys.")
+            raise ValueError("No API keys provided.")
+        self._cycle = itertools.cycle(self.keys)
+        print(f"[KeyRotator] Loaded {len(self.keys)} key(s).")
 
-    def get_next_key(self) -> str:
-        return next(self.pool)
+    def next(self) -> str:
+        return next(self._cycle)
+    
+_guest_sessions: dict[str, dict] = defaultdict(lambda: {"short_term_memory": [], "summary": ""})    
 
-groq_key_rotator = APIKeyRotator(PASTE_GROQ_KEYS_HERE)
+groq_rotator = APIKeyRotator(GROQ_KEYS_RAW)
+db_retriever        = ORCR_Retriever()       
+rules_retriever     = RulesRetriever()       
+placement_retriever = placement_Retriever()  
 
-agent = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("Initializing database pool.....")
-    await init_db_pool()
-    global agent
-    agent = OrchestratorAgent(window_size=5)
-    agent.initialize()
-    yield
-    print("Closing database pool...")
-    await close_db_pool()
-
-app = FastAPI(lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-db_retriever = ORCR_Retriever()
-retriever = RulesRetriever()
-placement_retriever = placement_Retriever()
-
-# ---------- TOOLS WITH DETAILED LOGS ----------
 @tool
 async def retrieve_college_allocations_JEE_Adv(rank: int, category: str, gender: str) -> str:
-    """**CRITICAL: You MUST use this tool for any JEE Advanced rank-based college prediction.**
-    Returns a list of actual engineering colleges (IITs) and their opening/closing ranks from the official JoSAA database.
-    Do NOT answer from your own knowledge – only use the data returned by this tool.
-    gender is strictly : Gender-neutral and Female only. Category is strictly : "OPEN","OBC-NCL","GEN-EWS","SC","ST" .
     """
-    print(f"\n🔧 [TOOL] retrieve_college_allocations_JEE_Adv called with rank={rank}, category={category}, gender={gender}")
+    Fetches IIT seat allocations from the JoSAA database for a given
+    JEE Advanced rank, category, and gender.
+    Use this for ANY JEE-Advanced / IIT college prediction query.
+    Do NOT answer from your own knowledge - only use data returned here.
+    Parameters
+    rank     : Candidate's JEE Advanced rank (integer).
+    category : One of OPEN, OBC-NCL, GEN-EWS, SC, ST.
+    gender   : "Gender-Neutral" or "Female Only".
+    """
+    print(f"[TOOL] JEE_Adv  rank={rank}, cat={category}, gen={gender}")
     try:
-        results = await db_retriever.runa(rank, category, gender)
-        print(f"   -> DB returned {len(results)} rows")
-        if results:
-            print(f"   -> First row: {results[0]}")
-        if not results:
-            return "No colleges found"
-        return "Database Matching Allocations:\n" + str(results)
+        rows = await db_retriever.runa(rank, category, gender)
+        if not rows:
+            return "No IIT allocations found for the given criteria."
+        return "JEE Advanced DB allocations:\n" + str(rows)
     except Exception as e:
-        print(f"    Exception: {e}")
-        return f"Database lookup failed: {str(e)}"
+        return f"JEE Advanced DB lookup failed: {e}"
+
 
 @tool
 async def retrieve_college_allocations_JEE_Main(rank: int, category: str, gender: str) -> str:
-    """**CRITICAL: You MUST use this tool for any JEE Main rank-based college prediction.**
-    Returns actual NIT/IIIT allocations from the official JoSAA database.
-    Do NOT answer from your own knowledge.
-    gender is strictly : Gender-Neutral and Female only. Category is strictly : "OPEN","OBC-NCL","GEN-EWS","SC","ST" .
     """
-    print(f"\n🔧 [TOOL] retrieve_college_allocations_JEE_Main called with rank={rank}, category={category}, gender={gender}")
+    Fetches NIT/IIIT seat allocations from the JoSAA database for a given
+    JEE Main rank, category, and gender.
+    Use this for ANY JEE-Main / NIT / IIIT college prediction query.
+    Do NOT answer from your own knowledge.
+    Parameters
+    rank     : Candidate's JEE Main CRL rank (integer).
+    category : One of OPEN, OBC-NCL, GEN-EWS, SC, ST.
+    gender   : "Gender-Neutral" or "Female Only".
+    """
+    print(f"[TOOL] JEE_Main rank={rank}, cat={category}, gen={gender}")
     try:
-        results = await db_retriever.runm(rank, category, gender)
-        print(f"   -> DB returned {len(results)} rows")
-        if results:
-            print(f"   -> First row: {results[0]}")
-        if not results:
-            return "No colleges found"
-        return "Database Matching Allocations:\n" + str(results)
+        rows = await db_retriever.runm(rank, category, gender)
+        if not rows:
+            return "No NIT/IIIT allocations found for the given criteria."
+        return "JEE Main DB allocations:\n" + str(rows)
     except Exception as e:
-        print(f"   ❌ Exception: {e}")
-        return f"Database lookup failed: {str(e)}"
+        return f"JEE Main DB lookup failed: {e}"
+
 
 @tool
 async def placement_data(institute: str) -> str:
-    """Fetches the latest placement statistics for a specified institute from the database."""
-    print(f"\n🔧 [TOOL] placement_data called with institute={institute}")
+    """
+    Returns the latest placement statistics (median salary, top recruiters,
+    placement percentage, etc.) for the specified institute.
+    Parameters
+    institute : Full institute name e.g. "IIT Bombay", "NIT Trichy".
+    """
+    print(f"[TOOL] placement_data  institute={institute}")
     try:
-        results = await placement_retriever.run(institute)
-        print(f"   -> DB returned {len(results)} records")
-        if results:
-            print(f"   -> First record: {results[0]}")
-        if not results:
-            return f"No placements data found for {institute}."
-        # Build a readable string (keeping original simple format)
-        s = ""
-        for item in results:
-            s += str(item) + "\n"
-        return f"Placements results for {institute} are : {s}"
+        rows = await placement_retriever.run(institute)
+        if not rows:
+            return f"No placement data found for '{institute}'."
+        return f"Placement data for {institute}:\n" + "\n".join(str(r) for r in rows)
     except Exception as e:
-        print(f"   ❌ Exception: {e}")
-        return f"Placement data retrieval failed."
+        return f"Placement retrieval failed: {e}"
+
 
 @tool
 async def search_jossa(query: str) -> str:
-    """Queries the local indexed document cache for official JoSAA rules, requirements, and reference PDFs."""
-    print(f"\n🔧 [TOOL] search_jossa called with query={query}")
+    """
+    Searches the local Qdrant index that contains official JoSAA PDFs
+    (rules, seat matrix, counselling procedures, cut-offs).
+    Use this for rule/process/eligibility questions.
+    Parameters
+    query : Natural-language question about JoSAA rules or procedures.
+    """
+    print(f"[TOOL] search_jossa  query={query!r}")
     try:
-        response = await asyncio.to_thread(retriever.search, query, 3)
-        print(f"   -> Retrieved chunks are 3 ")
-        if response:
-            print(f"   -> First chunk preview: ...")
-        return f"Found response for '{query}':\nresponse : {response}"
+        chunks = await rules_retriever.search(query, 3)
+        if not chunks:
+            return "No relevant JoSAA rule documents found."
+        return f"JoSAA rule excerpts for '{query}':\n" + "\n---\n".join(chunks)
     except Exception as e:
-        print(f"   ❌ Exception: {e}")
-        return f"JoSAA local index search failed: {str(e)}"
+        return f"Qdrant search failed: {e}"
+
 
 @tool
 async def search_google_images(query: str) -> str:
-    """Searches Google Images using Serper.dev and returns the top image URL."""
-    print(f"\n🔧 [TOOL] search_google_images called with query={query}")
-    url = "https://google.serper.dev/images"
-    payload = {"q": query, "num": 3}
-    headers = {"X-API-KEY": PASTE_SERPER_KEY_HERE, "Content-Type": "application/json"}
+    """
+    Searches Google Images via Serper.dev and returns the top image URL.
+    Use this when the user explicitly asks for a photo or image.
+    Parameters
+    query : Image search query string.
+    """
+    print(f"[TOOL] search_google_images  query={query!r}")
+    url     = "https://google.serper.dev/images"
+    headers = {"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(url, headers=headers, json=payload, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            images = data.get("images", [])
-            print(f"   -> Found {len(images)} images")
-            if images:
-                print(f"   -> First image URL: {images[0].get('imageUrl', 'N/A')}")
+            r = await client.post(url, headers=headers, json={"q": query, "num": 3}, timeout=10)
+            r.raise_for_status()
+            images = r.json().get("images", [])
             if not images:
-                return f"No images found for: {query}"
+                return f"No images found for '{query}'."
             fi = images[0]
-            return f"Image for '{query}' is:\nTitle: {fi.get('title', 'Image')}\nURL: {fi.get('imageUrl')}"
+            return f"Image for '{query}':\nTitle: {fi.get('title')}\nURL: {fi.get('imageUrl')}"
         except Exception as e:
-            print(f"   ❌ Exception: {e}")
-            return f"Image search failed for query: {query}"
+            return f"Image search failed: {e}"
+
 
 @tool
 async def search_web_serper(query: str) -> str:
-    """Searches the web via live Google engines to retrieve the latest real-time status and information updates."""
-    print(f"\n🔧 [TOOL] search_web_serper called with query={query}")
-    if not PASTE_SERPER_KEY_HERE:
-        return "Error: SERPER_API_KEY is not set."
-    url = "https://google.serper.dev/search"
-    payload = {"q": query}
-    headers = {"X-API-KEY": PASTE_SERPER_KEY_HERE, "Content-Type": "application/json"}
+    """
+    Performs a live Google web search via Serper.dev and returns the top
+    3 organic result snippets.  Use this for real-time / recent information.
+
+    Parameters
+    ----------
+    query : Web search query string.
+    """
+    print(f"[TOOL] search_web_serper  query={query!r}")
+    url     = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(url, headers=headers, json=payload, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            snippets = []
-            for item in data.get("organic", [])[:3]:
-                snippets.append(f"title : {item.get('title')}\nsnippet : {item.get('snippet')}")
-            print(f"   -> Got {len(snippets)} snippets")
-            if snippets:
-                print(f"   -> First snippet: {snippets[0][:100]}...")
+            r = await client.post(url, headers=headers, json={"q": query}, timeout=10)
+            r.raise_for_status()
+            organic = r.json().get("organic", [])[:3]
+            snippets = [f"{i['title']}\n{i['snippet']}" for i in organic]
             if not snippets:
-                return f"Found nothing on web about {query}"
-            return "Web search has given:\n" + "\n".join(snippets)
+                return f"No web results found for '{query}'."
+            return "Web search results:\n" + "\n---\n".join(snippets)
         except Exception as e:
-            print(f"   ❌ Exception: {e}")
-            return f"Web search for query: {query} returned an error or empty context."
+            return f"Web search failed: {e}"
 
-# ---------- AgentState and OrchestratorAgent ----------
+
+alltools: list = [
+    search_google_images,
+    search_web_serper,
+    search_jossa,
+    retrieve_college_allocations_JEE_Main,
+    retrieve_college_allocations_JEE_Adv,
+    placement_data,
+]
+tool_names: dict = {t.name: t for t in alltools}
+
 class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
-    short_term_memory: list
-    session_id: str
-    user_id: int
-    current_input: str
-    summary: str
+    messages:          Annotated[list, add_messages]
+    short_term_memory: list   
+    session_id:        str
+    user_id:           int
+    current_input:     str    
+    summary:           str     
+    final_response:    str 
+    session_key:Optional[str]   
 
 class OrchestratorAgent:
-    def __init__(self, window_size=5):
-        self.tools = []
-        self.llm_pool = None
-        self.graph = None
-        self.ws = window_size
-        self.summarizer = None
+    def __init__(self, window_size: int = 5):
+    
+        self.window_size   = window_size
+        self.orc_llm_cycle = None   
+        self.ans_llm_cycle = None  
+        self.summariser    = None
+        self.graph         = None
 
     def initialize(self):
-        self.tools = [search_google_images, search_web_serper, search_jossa,
-                      retrieve_college_allocations_JEE_Main, placement_data,
-                      retrieve_college_allocations_JEE_Adv]
-        keys = [k.strip() for k in PASTE_GROQ_KEYS_HERE.split(",") if k.strip()]
-        if not keys:
-            raise ValueError("No keys found please check the api store.")
-        llm_instances = []
-        for key in keys:
-            instance = ChatGroq(
-                model="openai/gpt-oss-120b",   # NOTE: Groq expects a valid model name like "mixtral-8x7b-32768"
-                temperature=0,
-                groq_api_key=key
-            ).bind_tools(self.tools)
-            llm_instances.append(instance)
-        self.llm_pool = itertools.cycle(llm_instances)
-        try:
-            self.summarizer = ChatGroq(model="llama3-70b-8192", temperature=0, groq_api_key=keys[0])
-        except Exception as e:
-            print(f"Summarizer init failed: {e}. Using main LLM.")
-            self.summarizer = ChatGroq(model="openai/gpt-oss-120b", temperature=0, groq_api_key=keys[0])
-        print(f"Successfully initialized LLM Pool with {len(llm_instances)} distinct API connections.")
-        self.graph = self._build_graph()
+     
+        keys = [k.strip() for k in GROQ_KEYS_RAW.split(",") if k.strip()]
+        orc_instances = [
+            ChatGroq(model=mmodel, temperature=0, groq_api_key=k).bind_tools(alltools)
+            for k in keys
+        ]
+        self.orc_llm_cycle = itertools.cycle(orc_instances)
+        ans_instances = [
+            ChatGroq(model=mmodel, temperature=0.3, groq_api_key=k)
+            for k in keys
+        ]
+        self.ans_llm_cycle = itertools.cycle(ans_instances)
 
-    def _build_graph(self):
-        builder = StateGraph(AgentState)
-        builder.add_node("load_memory", self._load_memory_node)
-        builder.add_node("agent", self._agent_node)
-        builder.add_node("tools", self._tools_node)
-        builder.add_node("save_memory", self.save_memory_node)
-        builder.add_edge(START, "load_memory")
-        builder.add_edge("load_memory", "agent")
-        builder.add_conditional_edges(
-            "agent",
-            self._route_after_agent,
-            {"tools": "tools", "save_memory": "save_memory"}
-        )
-        builder.add_edge("tools", "agent")
-        builder.add_edge("save_memory", END)
-        return builder.compile()
+        try:
+            self.summariser = ChatGroq(model=SUMMARISER_MODEL, temperature=0, groq_api_key=keys[0])
+        except Exception:
+            self.summariser = ChatGroq(model=mmodel, temperature=0, groq_api_key=keys[0])
+
+        self.graph = self._build_graph()
+        print("[OrchestratorAgent] Graph compiled successfully.")
+
+    def _build_graph(self) -> StateGraph:
+   
+        b = StateGraph(AgentState)
+        b.add_node("search_google_images_agent", self._make_specialist_node("search_google_images"))
+        b.add_node("load_memory",self._load_memory_node)
+        b.add_node("orchestrator_agent",self._orchestrator_node)
+        b.add_node("search_web_serper_agent",self._make_specialist_node("search_web_serper"))
+
+        b.add_node("search_jossa_agent",self._make_specialist_node("search_jossa"))
+        b.add_node("placement_agent",self._make_specialist_node("placement_data"))
+
+        b.add_node("answering_agent",self._answering_agent_node)
+        b.add_node("save_memory",self._save_memory_node)
+        b.add_node("jee_main_agent",self._make_specialist_node("retrieve_college_allocations_JEE_Main"))
+        b.add_node("jee_adv_agent",self._make_specialist_node("retrieve_college_allocations_JEE_Adv"))
+        
+        b.add_edge(START, "load_memory")
+        b.add_edge("load_memory", "orchestrator_agent")
+        b.add_conditional_edges(
+            "orchestrator_agent",
+            self._route_after_orchestrator,
+            ["search_google_images_agent","search_web_serper_agent", "search_jossa_agent","jee_main_agent","jee_adv_agent","placement_agent","answering_agent",],)
+        for node in [
+             "search_google_images_agent","search_web_serper_agent","search_jossa_agent","search_jossa_agent","jee_main_agent","jee_adv_agent","placement_agent",]:b.add_edge(node, "orchestrator_agent")
+        b.add_edge("answering_agent", "save_memory")
+        b.add_edge("save_memory", END)
+        return b.compile()
 
     async def _load_memory_node(self, state: AgentState) -> dict:
         user_profile = None
         pool = get_pool()
-        if pool is not None:
+        if state["user_id"]!=-1 and pool:
             async with pool.acquire() as conn:
                 user_profile = await get_by_id(cast(asyncpg.Connection, conn), state["user_id"])
+
         if user_profile:
-            user_info = f"""
-- Name: {user_profile.name}
-- Advanced Rank: {user_profile.adv_rank}
-- Mains Rank : {user_profile.mains_rank}
-- Category: {user_profile.category.value}
-- Gender: {user_profile.gender.value}
-- Preferred Branches: {', '.join(user_profile.preferred_branches) if user_profile.preferred_branches else 'None'}
-"""
+            user_info = (
+                f"- Name: {user_profile.name}\n"
+                f"- JEE Advanced Rank: {user_profile.adv_rank}\n"
+                f"- JEE Mains Rank: {user_profile.mains_rank}\n"
+                f"- Category: {user_profile.category.value}\n"
+                f"- Gender: {user_profile.gender.value}\n"
+                f"- Preferred Branches: "
+                f"{', '.join(user_profile.preferred_branches) if user_profile.preferred_branches else 'None'}"
+            )
+            rank_rules = """
+            STRICT RULES:
+            1. For JEE Advanced college predictions → ALWAYS call `retrieve_college_allocations_JEE_Adv` using the Advanced Rank, Category and Gender from the USER PROFILE above. Never ask the user for their rank again.
+            2. For JEE Main college predictions → ALWAYS call `retrieve_college_allocations_JEE_Main` using Mains Rank, Category and Gender from the USER PROFILE.
+            3. Never answer college prediction queries from your own knowledge. The database is the only authoritative source."""
+
         else:
-            user_info = "\n- User not found. Please register first."
+            user_info = "Guest user — no profile registered."
+            rank_rules = """
+            STRICT RULES:
+            1. The user has NOT registered. Extract rank, category, and gender DIRECTLY from their message.
+            2. For JEE Advanced / IIT queries → call `retrieve_college_allocations_JEE_Adv` with rank/category/gender parsed from the conversation. NEVER ask them to register.
+            3. For JEE Main / NIT / IIIT queries → call `retrieve_college_allocations_JEE_Main` with rank/category/gender parsed from the conversation.
+            4. If rank or category is missing from the message, ask ONLY for the missing piece. Do not ask them to register.
+            5. Never answer college prediction queries from your own knowledge. The database is the only authoritative source."""
 
-        system_prompt = f"""
-USER PROFILE = {user_info}
-*STRICT RULES – YOU MUST FOLLOW THESE*:
-1. *College Predictions (JEE Advanced)*:
-   - When the user asks for college predictions *for themselves* (e.g., "my rank", "colleges for me"), you MUST call retrieve_college_allocations_JEE_Adv using the *user's own Advanced Rank*, Category, and Gender from the USER PROFILE above.
-   - DO NOT ask the user for their rank again – it is already provided in the profile.
-   - Example: if the profile shows Advanced Rank: 1500, Category: OPEN, Gender: Gender-Neutral, call the tool with those exact values.
-   - NEVER answer from your own knowledge. The tool returns the only correct data.
+        system_prompt = f"""You are an expert JoSAA counselling assistant. You are advised to include images in your response as users like visuals. Use search_google_images for searching images related to the topic.
 
-2. *College Predictions (JEE Main)*:
-   - Similar rule – use the user's mains_rank if available, otherwise inform the user.
+                        USER PROFILE:
+                        {user_info}
 
-3. *Other tools* (placement, images, rules, web search) – use as before.
+                        {rank_rules}
+                        4. For placement stats → call `placement_data`. Never answer from web search, database is the only authoritative source.
+                        5. For JoSAA rules / procedures → call `search_jossa`. Authoritative source is the database but you can search the web using 'search_web_serper' in extreme cases.
+                        6. For current news / dates → call `search_web_serper`.
+                        7. For images → call `search_google_images`.
 
-4. rely on tools data for facts for answer formation do not make facts of your own.
+                        When you have all the information you need, produce a thorough reasoning summary (no need for markdown formatting - the answering agent will handle that)."""
+        
+        msgs: list = [SystemMessage(content=system_prompt)]
+        raw_memory = state.get("short_term_memory", [])
 
-5. if user asks query related to specfic 2-3 colleges then return images if important.
+        for turn in raw_memory[-10:]:
+            if isinstance(turn, str):
+                try:
+                    turn = json.loads(turn)
+                except Exception:
+                    continue
+            if not isinstance(turn, dict):
+                continue
+            if turn.get("role") == "user":
+                msgs.append(HumanMessage(content=turn["content"]))
+            elif turn.get("role") == "ai":
+                msgs.append(AIMessage(content=turn["content"]))
 
-*STRICT FORMATTING RULES*:
-- When a tool returns college allocation data (a list of records), you MUST render it as a markdown table. NEVER dump raw JSON or Python dicts.
-- The markdown table must have these exact columns: | Institute | Academic Program | Opening Rank | Closing Rank | Allotted On |
-- Every row from the tool result must appear as a table row. Do not skip or summarize rows.
-- Example table format:
-| Institute | Academic Program | Opening Rank | Closing Rank | Allotted On |
-|-----------|-----------------|--------------|--------------|-------------|
-| IIT Bombay | Computer Science and Engineering (4 Years B.Tech) | 1 | 66 | JEE Advanced |
-- Before the table, add one line: "College options for your JEE Advanced rank (rank, category, gender):"
-- Keep all other answers concise prose.
-- search_josaa outputs are authoritative do not ignore them.and give query for 2025 in josaa tool .
-"""
-        convmsg = [SystemMessage(content=system_prompt)]
-        if state.get("summary"):
-            convmsg.append(SystemMessage(content=f"Previous conversation summary:\n{state['summary']}"))
-        for item in state.get("short_term_memory", [])[-10:]:
-            if item.get("role") == "user":
-                convmsg.append(HumanMessage(content=item["content"]))
-            elif item.get("role") == "ai":
-                convmsg.append(AIMessage(content=item["content"]))
-        convmsg.append(HumanMessage(content=state.get("current_input")))
-        return {"messages": convmsg}
+        msgs.append(HumanMessage(content=state["current_input"]))  
 
-    async def _agent_node(self, state: AgentState) -> dict:
-        current_llm = next(self.llm_pool)
+        return {"messages": msgs}
+
+    
+    async def _orchestrator_node(self, state: AgentState) -> dict:
+        llm = next(self.orc_llm_cycle)
         try:
-            response = await current_llm.ainvoke(state["messages"])
+            response = await llm.ainvoke(state["messages"])
             return {"messages": [response]}
         except Exception as e:
-            print(f"   [LLM Pool Failover Triggered] Error context: {e}")
-            fallback = AIMessage(content="⚠️ Request peak limit reached across current pipeline node. Retrying connection...")
-            return {"messages": [fallback]}
+            print(f"[orchestrator_agent] LLM error: {e}")
+            return {"messages": [AIMessage(content=f" Orchestrator error: {e}")]}
 
-    async def _tools_node(self, state: AgentState) -> dict:
-        last_message = state["messages"][-1]
-        tools_lookup = {t.name: t for t in self.tools}
-        tool_results = []
-        for tool_call in last_message.tool_calls:
-            tool_func = tools_lookup.get(tool_call["name"])
-            if tool_func:
-                result = await tool_func.ainvoke(tool_call["args"])
-                tool_results.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
-        return {"messages": tool_results}
+    def _make_specialist_node(self, tool_name: str):
+        async def specialist_node(state: AgentState) -> dict:
+            print(f"[specialist] Running node for tool: {tool_name}")
+            last_msg = state["messages"][-1]
+            tool_func = tool_names.get(tool_name)
+            results: list = []
 
-    def _route_after_agent(self, state: AgentState) -> Literal["tools", "save_memory"]:
-        last_message = state["messages"][-1]
-        return "tools" if hasattr(last_message, "tool_calls") and last_message.tool_calls else "save_memory"
+            if not (hasattr(last_msg, "tool_calls") and last_msg.tool_calls):
+                return {"messages": results}
 
-    async def save_memory_node(self, state: AgentState) -> dict:
-        print("\n[SAVE MEMORY NODE]")
+            for tc in last_msg.tool_calls:
+                if tc["name"] != tool_name:
+                    continue
+                try:
+                    output = await tool_func.ainvoke(tc["args"])
+                except Exception as e:
+                    output = f"Tool {tool_name} failed: {e}"
+                results.append(
+                    ToolMessage(
+                        content=str(output),
+                        tool_call_id=tc["id"],
+                        name=tool_name,
+                    )
+                )
+            return {"messages": results}
+
+        specialist_node.__name__ = f"{tool_name}_node"
+        return specialist_node
+
+
+    def _route_after_orchestrator(self, state: AgentState):
+    
+        last_msg = state["messages"][-1]
+
+        if not (hasattr(last_msg, "tool_calls") and last_msg.tool_calls):
+            return "answering_agent"
+        tool_to_node = {
+            "search_google_images":"search_google_images_agent",
+            "search_web_serper":"search_web_serper_agent",
+            "search_jossa":"search_jossa_agent",
+            "retrieve_college_allocations_JEE_Main":"jee_main_agent",
+            "retrieve_college_allocations_JEE_Adv":"jee_adv_agent",
+            "placement_data":"placement_agent",
+        }
+
+        seen_nodes = set()
+        sends = []
+        for tc in last_msg.tool_calls:
+            node_name = tool_to_node.get(tc["name"])
+            if node_name and node_name not in seen_nodes:
+                seen_nodes.add(node_name)
+                sends.append(Send(node_name, state))
+
+        return sends if sends else "answering_agent"
+
+
+    async def _answering_agent_node(self, state: AgentState) -> dict:
+        orc_reasoning = ""
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
+                orc_reasoning = msg.content
+                break
+
+        formatting_prompt = f"""You are a friendly, expert JoSAA counselling assistant.
+Below is the raw reasoning from the research agent.  Your job is to rewrite it
+as a clear, well-structured, markdown-formatted answer for the student.
+Guidelines:
+1.  Use markdown tables for college lists (columns: Institute | Branch | Opening Rank | Closing Rank).
+2. Use bullet points for lists of rules or steps.
+3. Use **bold** for important numbers or names.
+4. Keep the tone warm and encouraging.
+5. End with a short actionable tip if relevant.
+RAW REASONING:
+{orc_reasoning}
+"""
+
+        llm = next(self.ans_llm_cycle)
+        try:
+            response = await llm.ainvoke([
+                    SystemMessage(content="You are a student-friendly formatter."),
+                    HumanMessage(content=formatting_prompt),
+                ])
+            return {"messages": [response]}
+        except Exception as e:
+            print(f"[answering_agent] error: {e}")
+            return {"messages": [AIMessage(content=orc_reasoning)]} 
+
+    async def _save_memory_node(self, state: AgentState) -> dict:
+
+        print("[save_memory] Persisting memory and usage.")
+
         final_response = ""
         for msg in reversed(state["messages"]):
             if isinstance(msg, AIMessage) and msg.content:
-                final_response = msg.content
+                final_response = msg.content if isinstance(msg.content, str) else str(msg.content)
                 break
-        current_mem = state.get("short_term_memory", [])
-        current_mem.append({"role": "user", "content": state["current_input"]})
-        current_mem.append({"role": "ai", "content": final_response})
-        max_messages = 12
+
+        raw = state.get("short_term_memory", [])
+        memory = []
+        for m in raw:
+            if isinstance(m, str):
+                try:
+                    memory.append(json.loads(m))  
+                except Exception:
+                    pass
+            elif isinstance(m, dict):
+                memory.append(m)                  
+
+        memory.append({"role": "user", "content": state["current_input"]})
+        memory.append({"role": "ai",   "content": final_response})
+
+        max_turns = self.window_size * 2
         old_summary = state.get("summary", "")
         new_summary = old_summary
-        if len(current_mem) > max_messages:
-            keep = len(current_mem) // 2
-            deleted = current_mem[:-keep]
-            remaining = current_mem[-keep:]
-            new_summary = await self.summarize_messages(deleted, old_summary)
-            current_mem = remaining
-            print(f"   Trimmed memory, kept {len(remaining)} messages.")
-        else:
-            new_summary = old_summary
+
+        if len(memory) > max_turns * 2:
+            half = len(memory) // 2
+            to_summarise = memory[:half]
+            memory = memory[half:]
+            new_summary = await self._summarise(to_summarise, old_summary)
+
         pool = get_pool()
-        if pool:
+        if pool and state["user_id"]!=-1:
             async with pool.acquire() as conn:
                 user = await get_by_id(cast(asyncpg.Connection, conn), state["user_id"])
                 if user:
                     new_usage = usage_schema(
                         queries_today=user.usage.queries_today + 1,
                         cooldown_until=user.usage.cooldown_until,
-                        last_query=datetime.now()
+                        last_query=datetime.now(),
                     )
-                    update_data = upadate_schema(usage=new_usage)
-                    await update_user(cast(asyncpg.Connection, conn), user.email, update_data)
+                    await update_user(
+                        cast(asyncpg.Connection, conn),
+                        user.email,
+                        upadate_schema(
+                            short_term_memory=[json.dumps(m) for m in memory],
+                            summary=new_summary,
+                            usage=new_usage,
+                        ),)
+        if state["user_id"] == -1:
+            session_key = state.get("session_key")
+            if session_key:
+                _guest_sessions[session_key]["short_term_memory"] = memory
+                _guest_sessions[session_key]["summary"] = new_summary
+                print(f"[save_memory] Updated guest session {session_key}")            
+                            
         return {
-            "short_term_memory": current_mem,
+            "short_term_memory": memory,       
             "summary": new_summary,
-            "final_response": final_response
-        }
-
-    async def summarize_messages(self, messages: list[dict], existing_summary: str) -> str:
+            "final_response": final_response,}
+    async def _summarise(self, messages: list[dict], existing: str) -> str:
         if not messages:
-            return existing_summary
-        conv = ""
-        for msg in messages:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            conv += f"{role}: {msg['content']}\n"
-        prompt = f"""Previous summary: {existing_summary if existing_summary else 'None'}
-
-New conversation excerpt:
-{conv}
-
-Produce a concise summary (max 200 tokens) integrating old and new."""
+            return existing
+        conv = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+            for m in messages
+        )
+        prompt = (
+            f"Existing summary:\n{existing or 'None'}\n\n"
+            f"New conversation to incorporate:\n{conv}\n\n"
+            "Write a concise summary (≤150 words) merging old and new."
+        )
         try:
-            response = await self.summarizer.ainvoke([
-                SystemMessage(content="You are a summarisation assistant."),
-                HumanMessage(content=prompt)
+            r = await self.summariser.ainvoke([
+                SystemMessage(content="You summarise conversations concisely."),
+                HumanMessage(content=prompt),
             ])
-            content = response.content
-            if isinstance(content, list):
-                content = ' '.join(str(part) for part in content)
-            return content.strip()
+            content = r.content
+            return (content if isinstance(content, str) else str(content)).strip()
         except Exception as e:
-            print(f"Summarization failed: {e}")
-            return existing_summary
-
-    async def chat(self, user_message: str, user_id: int, session_id: str,
-                   short_term_memory: list, summary: str) -> dict:
-        initial_state = {
-            "messages": [],
-            "short_term_memory": short_term_memory,
-            "session_id": session_id,
-            "user_id": user_id,
-            "current_input": user_message,
-            "summary": summary
-        }
-        final_state = await self.graph.ainvoke(cast(AgentState, initial_state))
-        return {
-            "updated_memory": final_state.get("short_term_memory", []),
-            "new_summary": final_state.get("summary", ""),
-            "final_response": final_state.get("final_response", "")
-        }
-
+            print(f"[summarise] Failed: {e}")
+            return existing
     def get_stream(self, initial_state: dict):
+        """Returns an async generator that yields (message, metadata) tuples."""
         return self.graph.astream(initial_state, stream_mode="messages")
-
-agent = OrchestratorAgent(window_size=5)
-
+_agent: Optional[OrchestratorAgent] = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: init DB pool + compile LangGraph. Shutdown: close pool."""
+    print("[lifespan] Starting up...")
+    await init_db_pool()
+    global _agent
+    _agent = OrchestratorAgent(window_size=5)
+    _agent.initialize()
+    print("[lifespan] Ready.")
+    yield
+    print("[lifespan] Shutting down...")
+    await close_db_pool()
+app = FastAPI(lifespan=lifespan, title="JoSAA AI Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 class ChatRequest(BaseModel):
-    query: str = ""
-    email: str
-    session_id: Optional[str] = "default_session"
-    name: Optional[str] = None
-    adv_rank: Optional[int] = None
-    mains_rank: Optional[int] = None
-    category: Optional[str] = "OPEN"
-    gender: Optional[str] = "Gender-Neutral"
+    query:      str
+    email: Optional[str]=None
+    session_id: Optional[str] = "None"
+    name:Optional[str]  = None
+    adv_rank:Optional[int]  = None
+    mains_rank: Optional[int]  = None
+    category:Optional[str]  = "OPEN"
+    gender:Optional[str]  = "Male"
 
 class CheckUserRequest(BaseModel):
     email: str
 
 @app.post("/check-user")
-async def check_user(request: CheckUserRequest):
+async def check_user(req: CheckUserRequest):
     pool = get_pool()
     if pool is None:
-        raise HTTPException(status_code=503, detail="Database not ready")
+        raise HTTPException(503, "Database not ready")
     async with pool.acquire() as conn:
-        user = await get_by_email(conn, request.email)
-        return {"exists": user is not None}
+        user = await get_by_email(conn, req.email)
+    return {"exists": user is not None}
 
 @app.post("/chat")
-async def joshai(request: ChatRequest):
-    if agent is None:
-        raise HTTPException(status_code=503, detail="Agent not initialised")
+async def chat_endpoint(req: ChatRequest):
+    if _agent is None:
+        raise HTTPException(503, "Agent not initialised")
+    
+    if not req.email:
+        session_key = req.session_id or str(uuid.uuid4())
+        guest_mem   = _guest_sessions[session_key]
+
+        initial_state = {
+            "messages":          [],
+            "short_term_memory": guest_mem["short_term_memory"],
+            "session_id":        session_key,
+            "user_id":           -1,
+            "current_input":     req.query,
+            "summary":           guest_mem["summary"],
+            "final_response":    "",
+            "session_key": session_key,
+        }
+
+        async def guest_streamer():
+            async for message, metadata in _agent.get_stream(initial_state):
+                node = metadata.get("langgraph_node", "")
+
+                if node == "orchestrator_agent" and isinstance(message, AIMessage):
+                    if hasattr(message, "tool_calls") and message.tool_calls:
+                        for tc in message.tool_calls:
+                            yield f"||TOOL_CALL:{tc['name']}||\n"
+
+                elif node == "answering_agent" and isinstance(message, AIMessage):
+                    content = message.content
+                    if isinstance(content, list):
+                        content = " ".join(str(p) for p in content)
+                    if content:
+                        yield content
+
+                elif node == "save_memory" and isinstance(message, dict):
+                    # persist in-memory for this session
+                    _guest_sessions[session_key]["short_term_memory"] = message.get(
+                        "short_term_memory", guest_mem["short_term_memory"]
+                    )
+                    _guest_sessions[session_key]["summary"] = message.get(
+                        "summary", guest_mem["summary"]
+                    )
+
+        return StreamingResponse(guest_streamer(), media_type="text/plain")
+
     pool = get_pool()
     if pool is None:
-        raise HTTPException(status_code=503, detail="Database not ready")
+        raise HTTPException(503, "Database not ready")
 
     async with pool.acquire() as conn:
-        user = await get_by_email(conn, request.email)
+        user = await get_by_email(conn, req.email)
         if user is None:
-            usage = usage_schema(queries_today=0)
             try:
-                cat_enum = Category(request.category)
+                cat_enum = Category(req.category)
             except ValueError:
                 cat_enum = Category.OPEN
             try:
-                gen_enum = Gender(request.gender)
+                gen_enum = Gender(req.gender)
             except ValueError:
                 gen_enum = Gender.male
+
             user_data = create_schema(
-                name=request.name or request.email.split("@")[0],
-                email=request.email,
-                adv_rank=request.adv_rank or 0,
-                mains_rank=request.mains_rank,
+                name=req.name or req.email.split("@")[0],
+                email=req.email,
+                adv_rank=req.adv_rank or 0,
+                mains_rank=req.mains_rank,
                 category=cat_enum,
                 gender=gen_enum,
                 preferred_branches=[],
-                usage=usage,
+                usage=usage_schema(queries_today=0),
                 short_term_memory=[],
-                summary=""
+                summary="",
             )
             user = await create_user(conn, user_data)
-            print(f"Created new user: {user.name} (id={user.id})")
+            print(f"[chat] Created user: {user.name}")
         else:
-            print(f"Existing user: {user.name} (id={user.id})")
-        user_id = user.id
-        short_term_memory = user.short_term_memory or []
-        summary = user.summary or ""
+            print(f"[chat] Existing user: {user.name}")
 
     initial_state = {
-        "messages": [],
-        "short_term_memory": short_term_memory,
-        "session_id": request.session_id,
-        "user_id": user_id,
-        "current_input": request.query,
-        "summary": summary
+        "messages":          [],
+        "short_term_memory": user.short_term_memory or [],
+        "session_id":        req.session_id,
+        "user_id":           user.id,
+        "current_input":     req.query,
+        "summary":           user.summary or "",
+        "final_response":    "",
     }
 
     async def token_streamer():
-        async for message, metadata in agent.get_stream(initial_state):
-            if isinstance(message, AIMessage) and metadata.get("langgraph_node") == "agent":
+        async for message, metadata in _agent.get_stream(initial_state):
+            node = metadata.get("langgraph_node", "")
+
+            if node == "orchestrator_agent" and isinstance(message, AIMessage):
                 if hasattr(message, "tool_calls") and message.tool_calls:
                     for tc in message.tool_calls:
-                        yield f"||TOOL_CALL:{tc['name']}||"
-                        
+                        yield f"||TOOL_CALL:{tc['name']}||\n"
+
+            elif node == "answering_agent" and isinstance(message, AIMessage):
                 content = message.content
                 if isinstance(content, list):
-                    content = ' '.join(str(part) for part in content)
+                    content = " ".join(str(p) for p in content)
                 if content:
                     yield content
 
     return StreamingResponse(token_streamer(), media_type="text/plain")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
