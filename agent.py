@@ -23,6 +23,8 @@ from langchain_core.tools import tool
 from user_crud_asyncpg import init_db_pool, close_db_pool, get_pool, get_by_email, create_user, update_user, create_schema, usage_schema, upadate_schema, Category, Gender, get_by_id
 from datetime import datetime
 from pydantic import BaseModel
+from langchain_community.tools import DuckDuckGoSearchRun
+
 
 load_dotenv()
 PASTE_GROQ_KEYS_HERE = os.getenv("GROQ_API_KEY", "")  # comma separated if multiple
@@ -68,8 +70,43 @@ app.add_middleware(
 db_retriever = ORCR_Retriever()
 retriever = RulesRetriever()
 placement_retriever = placement_Retriever()
+search_tool = DuckDuckGoSearchRun()
 
 # ---------- TOOLS WITH DETAILED LOGS ----------
+
+@tool
+async def retrieve_college_allocations_institutewise(institute: str, category: str, gender: str) -> str:
+    """**CRITICAL: Use this tool for opening/closing ranks of a specific IIT and its branches.**
+    Returns a list of all branches of a given IIT with their opening and closing ranks from the official JoSAA database.
+    Use this when the user asks about ranks for a particular institute (e.g., "What are the opening/closing ranks for IIT Bombay?").
+    Do NOT answer from your own knowledge.
+    gender must be "Gender-Neutral" or "Female-Only". Category: "OPEN","OBC-NCL","GEN-EWS","SC","ST".
+    institute: full IIT name without spaces (e.g., "IITBombay", "IITDelhi", "IITMadras"). except for just two specific ones use IIT(ISM) Dhanbad and IIT(BHU) Varanasi.
+    """
+    gender_map = {
+        "female": "Female-Only",
+        "female-only": "Female-Only",
+        "female only": "Female-Only",
+        "gender-neutral": "Gender-Neutral",
+        "male": "Gender-Neutral",
+        "neutral": "Gender-Neutral",
+    }
+    gender = gender_map.get(gender.lower().strip(), gender)
+
+    print(f"\n🔧 [TOOL] retrieve_college_allocations_institutewise called with institute={institute}, category={category}, gender={gender}")
+    try:
+        results = await db_retriever.runinstitute(institute, category, gender)
+        print(f"   -> DB returned {len(results)} rows")
+        if results:
+            print(f"   -> First row: {results[0]}")
+        if not results:
+            return f"No branch data found for {institute} with category {category}, gender {gender}."
+        return "Database Matching Allocations:\n" + str(results)
+    except Exception as e:
+        print(f"    Exception: {e}")
+        return f"Database lookup failed: {str(e)}"
+
+
 @tool
 async def retrieve_college_allocations_JEE_Adv(rank: int, category: str, gender: str) -> str:
     """**CRITICAL: You MUST use this tool for any JEE Advanced rank-based college prediction.**
@@ -197,33 +234,20 @@ async def search_google_images(query: str) -> str:
 
 @tool
 async def search_web_serper(query: str) -> str:
-    """Searches the web via live Google engines to retrieve the latest real-time status and information updates.
-    when asked for anything for colleges except for placement and seat allocation ranks use this tool.
-    use this for question related to nirf rankings , general and cultural questions related to colleges as well"""
+    """Searches the web via DuckDuckGo to retrieve the latest real-time status and information updates.
+    When asked for anything for colleges except for placement and seat allocation ranks use this tool.
+    Use this for questions related to nirf rankings, general and cultural questions related to colleges as well.
+    Try to answer from official sources only."""
     print(f"\n🔧 [TOOL] search_web_serper called with query={query}")
-    if not PASTE_SERPER_KEY_HERE:
-        return "Error: SERPER_API_KEY is not set."
-    url = "https://google.serper.dev/search"
-    payload = {"q": query}
-    headers = {"X-API-KEY": PASTE_SERPER_KEY_HERE, "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, headers=headers, json=payload, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            snippets = []
-            for item in data.get("organic", [])[:3]:
-                snippets.append(f"title : {item.get('title')}\nsnippet : {item.get('snippet')}")
-            print(f"   -> Got {len(snippets)} snippets")
-            if snippets:
-                print(f"   -> First snippet: {snippets[0][:100]}...")
-            if not snippets:
-                return f"Found nothing on web about {query}"
-            return "Web search has given:\n" + "\n".join(snippets)
-        except Exception as e:
-            print(f"   ❌ Exception: {e}")
-            return f"Web search for query: {query} returned an error or empty context."
-
+    try:
+        result = await asyncio.to_thread(search_tool.run, query)
+        print(f"   -> Got result: {str(result)[:100]}...")
+        return f"Web search has given:\n{result}"
+    except Exception as e:
+        print(f"   ❌ Exception: {e}")
+        return f"Web search for query: {query} returned an error or empty context."
+    
+    
 # ---------- AgentState and OrchestratorAgent ----------
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
@@ -244,7 +268,7 @@ class OrchestratorAgent:
     def initialize(self):
         self.tools = [search_google_images, search_web_serper, search_jossa,
                       retrieve_college_allocations_JEE_Main, placement_data,
-                      retrieve_college_allocations_JEE_Adv]
+                      retrieve_college_allocations_JEE_Adv,retrieve_college_allocations_institutewise]
         keys = [k.strip() for k in PASTE_GROQ_KEYS_HERE.split(",") if k.strip()]
         if not keys:
             raise ValueError("No keys found please check the api store.")
@@ -345,9 +369,11 @@ You are Josh AI, a JoSAA counselling assistant built at IIT Indore.
 - If the user has jee adv rank and is of gender-Female then call `retrieve_college_allocations_JEE_Adv` with gender - Female-Only. if she asks for ranks / colleges available for rank
 - JEE Advanced predictions → `retrieve_college_allocations_JEE_Adv`
 - JEE Main predictions → `retrieve_college_allocations_JEE_Main`
+- Institute‑wise branch ranks → `retrieve_college_allocations_institutewise`. if someone asks for orcr of a particular branch of a particular insitiute then this.
+  for iit bhu and iit dhanbad . use these are arguments in institute names  IIT(ISM) Dhanbad and IIT(BHU) Varanasi.
 - Placements → `placement_data`, when giving sources give the hyperlinks of the source
 - JoSAA rules → `search_jossa`
-- Web search (rankings, general college info) → `search_web_serper`
+- Web search (rankings, general college info) → `search_web_serper`. dont hallucinate the data on your own.
 - Images → `search_google_images`
 
 **STRICT FORMATTING RULES (DO NOT CHANGE):**
