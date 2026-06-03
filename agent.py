@@ -29,6 +29,7 @@ PASTE_GROQ_KEYS_HERE = os.getenv("GROQ_API_KEY", "")  # comma separated if multi
 PASTE_SERPER_KEY_HERE = os.getenv("SERPER_API_KEY", "")
 
 SESSION_STORAGE = {}
+guest_session:dict[str,dict]={}
 
 class APIKeyRotator:
     def __init__(self, raw_keys_string: str):
@@ -73,9 +74,21 @@ placement_retriever = placement_Retriever()
 async def retrieve_college_allocations_JEE_Adv(rank: int, category: str, gender: str) -> str:
     """**CRITICAL: You MUST use this tool for any JEE Advanced rank-based college prediction.**
     Returns a list of actual engineering colleges (IITs) and their opening/closing ranks from the official JoSAA database.
-    Do NOT answer from your own knowledge – only use the data returned by this tool.
-    gender is strictly : Gender-neutral and Female only. Category is strictly : "OPEN","OBC-NCL","GEN-EWS","SC","ST" .
+    Do NOT answer from your own knowledge . 
+    gender is strictly : Gender-Neutral and Female-Only. Category is strictly : "OPEN","OBC-NCL","GEN-EWS","SC","ST" .
     """
+    gender_map = {
+        "female": "Female-Only",
+        "female-only": "Female-Only", 
+        "female only": "Female-Only",
+        "gender-neutral": "Gender-Neutral",
+        "male": "Gender-Neutral",
+        "neutral": "Gender-Neutral",
+    }
+    gender = gender_map.get(gender.lower().strip(), gender)
+
+
+
     print(f"\n🔧 [TOOL] retrieve_college_allocations_JEE_Adv called with rank={rank}, category={category}, gender={gender}")
     try:
         results = await db_retriever.runa(rank, category, gender)
@@ -94,8 +107,21 @@ async def retrieve_college_allocations_JEE_Main(rank: int, category: str, gender
     """**CRITICAL: You MUST use this tool for any JEE Main rank-based college prediction.**
     Returns actual NIT/IIIT allocations from the official JoSAA database.
     Do NOT answer from your own knowledge.
-    gender is strictly : Gender-Neutral and Female only. Category is strictly : "OPEN","OBC-NCL","GEN-EWS","SC","ST" .
+    gender is strictly : Gender-Neutral and Female-Only. Category is strictly : "OPEN","OBC-NCL","GEN-EWS","SC","ST" .
     """
+
+    gender_map = {
+        "female": "Female-Only",
+        "female-only": "Female-Only", 
+        "female only": "Female-Only",
+        "gender-neutral": "Gender-Neutral",
+        "male": "Gender-Neutral",
+        "neutral": "Gender-Neutral",
+    }
+    gender = gender_map.get(gender.lower().strip(), gender)
+
+
+
     print(f"\n🔧 [TOOL] retrieve_college_allocations_JEE_Main called with rank={rank}, category={category}, gender={gender}")
     try:
         results = await db_retriever.runm(rank, category, gender)
@@ -111,7 +137,8 @@ async def retrieve_college_allocations_JEE_Main(rank: int, category: str, gender
 
 @tool
 async def placement_data(institute: str) -> str:
-    """Fetches the latest placement statistics for a specified institute from the database."""
+    """Fetches the latest placement statistics for a specified institute from the database.
+    use this as primary source of placement"""
     print(f"\n🔧 [TOOL] placement_data called with institute={institute}")
     try:
         results = await placement_retriever.run(institute)
@@ -131,7 +158,8 @@ async def placement_data(institute: str) -> str:
 
 @tool
 async def search_jossa(query: str) -> str:
-    """Queries the local indexed document cache for official JoSAA rules, requirements, and reference PDFs."""
+    """Queries the local indexed document cache for official JoSAA rules, requirements, and reference PDFs.
+    use this as a primary source of data for any rules for josaa"""
     print(f"\n🔧 [TOOL] search_jossa called with query={query}")
     try:
         response = await asyncio.to_thread(retriever.search, query, 3)
@@ -169,7 +197,9 @@ async def search_google_images(query: str) -> str:
 
 @tool
 async def search_web_serper(query: str) -> str:
-    """Searches the web via live Google engines to retrieve the latest real-time status and information updates."""
+    """Searches the web via live Google engines to retrieve the latest real-time status and information updates.
+    when asked for anything for colleges except for placement and seat allocation ranks use this tool.
+    use this for question related to nirf rankings , general and cultural questions related to colleges as well"""
     print(f"\n🔧 [TOOL] search_web_serper called with query={query}")
     if not PASTE_SERPER_KEY_HERE:
         return "Error: SERPER_API_KEY is not set."
@@ -253,42 +283,74 @@ class OrchestratorAgent:
         return builder.compile()
 
     async def _load_memory_node(self, state: AgentState) -> dict:
+
+        print(f"[DEBUG] short_term_memory length: {len(state.get('short_term_memory', []))}")
+        print(f"[DEBUG] summary exists: {bool(state.get('summary'))}")
+
+        if state.get("summary"):
+            print(f"[DEBUG] summary preview: {state['summary'][:200]}")
+
         user_profile = None
-        pool = get_pool()
-        if pool is not None:
-            async with pool.acquire() as conn:
-                user_profile = await get_by_id(cast(asyncpg.Connection, conn), state["user_id"])
+        if state["user_id"]!=-1:
+            pool=get_pool()
+            if pool is not None:
+                async with pool.acquire() as conn:
+                    user_profile = await get_by_id(cast(asyncpg.Connection, conn), state["user_id"])
+
+        if user_profile:    
+            stored_gender=user_profile.gender.value
+            if stored_gender=="Female":
+                tool_gender="Female-Only"
+            else:
+                tool_gender="Gender-Neutral"
+
+
+
         if user_profile:
             user_info = f"""
 - Name: {user_profile.name}
 - Advanced Rank: {user_profile.adv_rank}
 - Mains Rank : {user_profile.mains_rank}
 - Category: {user_profile.category.value}
-- Gender: {user_profile.gender.value}
+- Gender: {tool_gender}
 - Preferred Branches: {', '.join(user_profile.preferred_branches) if user_profile.preferred_branches else 'None'}
 """
         else:
-            user_info = "\n- User not found. Please register first."
+            user_info = "\n- Guest user . please fetch the user info like jee mains rank , jee adv rank, category and gender from the conversation "
 
+        print(f"[DEBUG] user_info: {user_info}")
         system_prompt = f"""
-USER PROFILE = {user_info}
-*STRICT RULES – YOU MUST FOLLOW THESE*:
-1. *College Predictions (JEE Advanced)*:
-   - When the user asks for college predictions *for themselves* (e.g., "my rank", "colleges for me"), you MUST call retrieve_college_allocations_JEE_Adv using the *user's own Advanced Rank*, Category, and Gender from the USER PROFILE above.
-   - DO NOT ask the user for their rank again – it is already provided in the profile.
-   - Example: if the profile shows Advanced Rank: 1500, Category: OPEN, Gender: Gender-Neutral, call the tool with those exact values.
-   - NEVER answer from your own knowledge. The tool returns the only correct data.
+USER PROFILE = {user_info} for ranks for tool calling use this for registered users . it has rank,gender,category for registered users.
 
-2. *College Predictions (JEE Main)*:
-   - Similar rule – use the user's mains_rank if available, otherwise inform the user.
+You are Josh AI, a JoSAA counselling assistant built at IIT Indore.
 
-3. *Other tools* (placement, images, rules, web search) – use as before.
+**ALLOWED TOPICS (answer naturally, use tools when needed):**
+- JEE (Advanced/Main) rank analysis, cutoffs, seat allocation, JoSAA rules.
+- College culture, coding culture, hackathons, fests, student life, infrastructure.
+- NIRF rankings, placements, branch comparisons, faculty, scholarships.
+- Admission procedures, fees, document verification, any engineering college queries.
 
-4. rely on tools data for facts for answer formation do not make facts of your own.
+**OUT-OF-SCOPE (do NOT answer, use this exact redirect message):**
+- General knowledge, travel, food, politics, entertainment, personal identity, non-engineering subjects.
+- Redirect: "I'm Josh AI – I only help with engineering colleges, JEE, JoSAA, placements, and rankings. Please ask me something related to your engineering admission."
+- Redirect only when the topic is not related to colleges , rankings , college culture or anything related to colleges.
 
-5. if user asks query related to specfic 2-3 colleges then return images if important.
+**IMPORTANT – CONVERSATION MEMORY**:
+- Below you will find: past conversation
+- us the past conversation to for context for better anwers for current query.
+- If the information is not in the summary or recent messages, say you don't know, but never claim you have no record when you actually do.
 
-*STRICT FORMATTING RULES*:
+**Tool rules:**
+- When calling college allocation tools, always use exactly "Gender-Neutral" or "Female-Only" as the gender parameter.
+- If the user has jee adv rank and is of gender-Female then call `retrieve_college_allocations_JEE_Adv` with gender - Female-Only. if she asks for ranks / colleges available for rank
+- JEE Advanced predictions → `retrieve_college_allocations_JEE_Adv`
+- JEE Main predictions → `retrieve_college_allocations_JEE_Main`
+- Placements → `placement_data`, when giving sources give the hyperlinks of the source
+- JoSAA rules → `search_jossa`
+- Web search (rankings, general college info) → `search_web_serper`
+- Images → `search_google_images`
+
+**STRICT FORMATTING RULES (DO NOT CHANGE):**
 - When a tool returns college allocation data (a list of records), you MUST render it as a markdown table. NEVER dump raw JSON or Python dicts.
 - The markdown table must have these exact columns: | Institute | Academic Program | Opening Rank | Closing Rank | Allotted On |
 - Every row from the tool result must appear as a table row. Do not skip or summarize rows.
@@ -297,12 +359,14 @@ USER PROFILE = {user_info}
 |-----------|-----------------|--------------|--------------|-------------|
 | IIT Bombay | Computer Science and Engineering (4 Years B.Tech) | 1 | 66 | JEE Advanced |
 - Before the table, add one line: "College options for your JEE Advanced rank (rank, category, gender):"
-- Keep all other answers concise prose.
-- search_josaa outputs are authoritative do not ignore them.and give query for 2025 in josaa tool .
+- for mains rank also return the quota in the answer table for the colleges
+- `search_josaa` outputs are authoritative – do not ignore them. Always query for the current year (e.g., 2025) in the josaa tool.
+
+- When the user asks about something said earlier, refer to the **Previous conversation summary** and the **recent messages** below.
 """
         convmsg = [SystemMessage(content=system_prompt)]
         if state.get("summary"):
-            convmsg.append(SystemMessage(content=f"Previous conversation summary:\n{state['summary']}"))
+            convmsg.append(SystemMessage(content=f"PREVIOUS CONVERSATION SUMMARY :\n{state['summary']}"))
         for item in state.get("short_term_memory", [])[-10:]:
             if item.get("role") == "user":
                 convmsg.append(HumanMessage(content=item["content"]))
@@ -358,18 +422,36 @@ USER PROFILE = {user_info}
             print(f"   Trimmed memory, kept {len(remaining)} messages.")
         else:
             new_summary = old_summary
-        pool = get_pool()
-        if pool:
-            async with pool.acquire() as conn:
-                user = await get_by_id(cast(asyncpg.Connection, conn), state["user_id"])
-                if user:
-                    new_usage = usage_schema(
-                        queries_today=user.usage.queries_today + 1,
-                        cooldown_until=user.usage.cooldown_until,
-                        last_query=datetime.now()
-                    )
-                    update_data = upadate_schema(usage=new_usage)
-                    await update_user(cast(asyncpg.Connection, conn), user.email, update_data)
+
+        if state["user_id"]==-1:
+            session_id=state.get("session_id")
+            if session_id:
+                guest_session[session_id]={
+                    "short_term_memory":current_mem,
+                    "summary":new_summary
+                }
+                print(f"[save_memory] Updated guest session {session_id}")
+
+        else:        
+
+
+            pool = get_pool()
+            if pool:
+                async with pool.acquire() as conn:
+                    user = await get_by_id(cast(asyncpg.Connection, conn), state["user_id"])
+                    if user:
+                        new_usage = usage_schema(
+                            queries_today=user.usage.queries_today + 1,
+                            cooldown_until=user.usage.cooldown_until,
+                            last_query=datetime.now()
+                        )
+
+                        update_data = upadate_schema(
+                            short_term_memory=current_mem,   
+                            summary=new_summary,             
+                            usage=new_usage
+                        )
+                        await update_user(cast(asyncpg.Connection, conn), user.email, update_data)
         return {
             "short_term_memory": current_mem,
             "summary": new_summary,
@@ -425,14 +507,15 @@ Produce a concise summary (max 200 tokens) integrating old and new."""
 agent = OrchestratorAgent(window_size=5)
 
 class ChatRequest(BaseModel):
-    query: str = ""
-    email: str
-    session_id: Optional[str] = "default_session"
-    name: Optional[str] = None
-    adv_rank: Optional[int] = None
-    mains_rank: Optional[int] = None
-    category: Optional[str] = "OPEN"
-    gender: Optional[str] = "Gender-Neutral"
+    query:str = ""
+    email:Optional[str]=None
+    skip_registration:Optional[bool]=False
+    session_id:Optional[str]="default_session"
+    name:Optional[str]=None
+    adv_rank:Optional[int]=None
+    mains_rank:Optional[int]=None
+    category:Optional[str]="OPEN"
+    gender:Optional[str] = "None"
 
 class CheckUserRequest(BaseModel):
     email: str
@@ -450,46 +533,69 @@ async def check_user(request: CheckUserRequest):
 async def joshai(request: ChatRequest):
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialised")
-    pool = get_pool()
-    if pool is None:
-        raise HTTPException(status_code=503, detail="Database not ready")
+    
+    is_guest = request.skip_registration or not request.email
 
-    async with pool.acquire() as conn:
-        user = await get_by_email(conn, request.email)
-        if user is None:
-            usage = usage_schema(queries_today=0)
-            try:
-                cat_enum = Category(request.category)
-            except ValueError:
-                cat_enum = Category.OPEN
-            try:
-                gen_enum = Gender(request.gender)
-            except ValueError:
-                gen_enum = Gender.male
-            user_data = create_schema(
-                name=request.name or request.email.split("@")[0],
-                email=request.email,
-                adv_rank=request.adv_rank or 0,
-                mains_rank=request.mains_rank,
-                category=cat_enum,
-                gender=gen_enum,
-                preferred_branches=[],
-                usage=usage,
-                short_term_memory=[],
-                summary=""
-            )
-            user = await create_user(conn, user_data)
-            print(f"Created new user: {user.name} (id={user.id})")
-        else:
-            print(f"Existing user: {user.name} (id={user.id})")
-        user_id = user.id
-        short_term_memory = user.short_term_memory or []
-        summary = user.summary or ""
+    if is_guest:
+
+        session_key=request.session_id or str(uuid.uuid4())
+        if session_key not in guest_session:
+            guest_session[session_key]={"short_term_memory": [], "summary":""}
+
+        guest_mem=guest_session[session_key]
+        short_term_memory=guest_mem["short_term_memory"]
+        summary=guest_mem["summary"]
+        user_id=-1
+        print(f"[Guest] Session {session_key} started")    
+
+    else:     
+
+        pool = get_pool()
+        if pool is None:
+            raise HTTPException(status_code=503, detail="Database not ready")
+
+        async with pool.acquire() as conn:
+            user = await get_by_email(conn, request.email)
+            if user is None:
+                usage = usage_schema(queries_today=0)
+                try:
+                    cat_enum = Category(request.category)
+                except ValueError:
+                    cat_enum = Category.OPEN
+                try:
+                    gen_enum = Gender(request.gender)
+                except ValueError:
+                    gen_enum = Gender.male
+                user_data = create_schema(
+                    name=request.name or request.email.split("@")[0],
+                    email=request.email,
+                    adv_rank=request.adv_rank or 0,
+                    mains_rank=request.mains_rank,
+                    category=cat_enum,
+                    gender=gen_enum,
+                    preferred_branches=[],
+                    usage=usage,
+                    short_term_memory=[],
+                    summary=""
+                )
+                user = await create_user(conn, user_data)
+                print(f"Created new user: {user.name} (id={user.id})")
+            else:
+                print(f"Existing user: {user.name} (id={user.id})")
+            user_id = user.id
+            short_term_memory = user.short_term_memory or []
+            summary = user.summary or ""
+
+    if is_guest:
+        effective_session_id=request.session_id or session_key
+    else:
+        effective_session_id=request.session_id    
+
 
     initial_state = {
         "messages": [],
         "short_term_memory": short_term_memory,
-        "session_id": request.session_id,
+        "session_id": effective_session_id,
         "user_id": user_id,
         "current_input": request.query,
         "summary": summary
